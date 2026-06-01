@@ -11,7 +11,6 @@
 - 🇯🇵 日本語 (Soon)
 - 🇪🇸 Español (Soon)
 
-🌍 **Help translate CodeGraphContext to your language by raising an issue & PR on https://github.com/Shashankss1205/CodeGraphContext/issues!**
 
 <p align="center">
   <br>
@@ -97,26 +96,10 @@ A powerful **MCP server** and **CLI toolkit** that indexes local code into a gra
 
 ---
 
-## Project Details
-- **Version:** 0.4.12
-- **Authors:** Shashank Shekhar Singh <shashankshekharsingh1205@gmail.com>
-- **License:** MIT License (See [LICENSE](LICENSE) for details)
 - **Website:** [CodeGraphContext](http://codegraphcontext.vercel.app/)
 
 ---
 
-## 👨‍💻 Maintainer
-**CodeGraphContext** is created and actively maintained by:
-
-**Shashank Shekhar Singh**  
-- 📧 Email: [shashankshekharsingh1205@gmail.com](mailto:shashankshekharsingh1205@gmail.com)
-- 🐙 GitHub: [@Shashankss1205](https://github.com/Shashankss1205)
-- 🔗 LinkedIn: [Shashank Shekhar Singh](https://www.linkedin.com/in/shashank-shekhar-singh-a67282228/)
-- 🌐 Website: [codegraphcontext.vercel.app](https://codegraphcontext.vercel.app/)
-
-*Contributions and feedback are always welcome! Feel free to reach out for questions, suggestions, or collaboration opportunities.*
-
----
 
 ## Star History
 [![Star History Chart](https://api.star-history.com/svg?repos=CodeGraphContext/CodeGraphContext&type=Date)](https://www.star-history.com/#CodeGraphContext/CodeGraphContext&Date)
@@ -463,10 +446,3 @@ Once the server is running, you can interact with it through your AI assistant u
 
 ---
 
-## Contributing
-
-Contributions are welcome! 🎉  
-Please see our [CONTRIBUTING.md](CONTRIBUTING.md) for detailed guidelines.
-If you have ideas for new features, integrations, or improvements, open an [issue](https://github.com/CodeGraphContext/CodeGraphContext/issues) or submit a Pull Request.
-
-Join discussions and help shape the future of CodeGraphContext.
