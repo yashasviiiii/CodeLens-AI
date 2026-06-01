@@ -1,0 +1,384 @@
+# src/codegraphcontext/core/watcher.py
+"""
+This module implements the live file-watching functionality using the `watchdog` library.
+It observes directories for changes and triggers updates to the code graph.
+"""
+import threading
+from pathlib import Path
+import typing
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+
+if typing.TYPE_CHECKING:
+    from pathspec import PathSpec
+    from codegraphcontext.tools.graph_builder import GraphBuilder
+    from codegraphcontext.core.jobs import JobManager
+
+from codegraphcontext.core.cgcignore import build_ignore_spec
+from codegraphcontext.tools.indexing.constants import DEFAULT_IGNORE_PATTERNS
+from codegraphcontext.cli.config_manager import get_config_value
+from codegraphcontext.utils.debug_log import debug_log, info_logger, error_logger, warning_logger
+
+class RepositoryEventHandler(FileSystemEventHandler):
+    """
+    A dedicated event handler for a single repository being watched.
+    
+    This handler is stateful. It performs an initial scan of the repository
+    to build a baseline and then uses this cached state to perform efficient
+    updates when files are changed, created, or deleted.
+    """
+    def __init__(
+        self,
+        graph_builder: "GraphBuilder",
+        repo_path: Path,
+        debounce_interval=2.0,
+        perform_initial_scan: bool = True,
+        cgcignore_path: str = None,
+        ignore_spec: "PathSpec" = None,
+    ):
+        """
+        Initializes the event handler.
+
+        Args:
+            graph_builder: An instance of the GraphBuilder to perform graph operations.
+            repo_path: The absolute path to the repository directory to watch.
+            debounce_interval: The time in seconds to wait for more changes before processing an event.
+            perform_initial_scan: Whether to perform an initial scan of the repository.
+            cgcignore_path: Optional explicit .cgcignore path from the active context.
+            ignore_spec: Optional precompiled ignore spec, useful for tests.
+        """
+        super().__init__()
+        self.graph_builder = graph_builder
+        self.repo_path = repo_path.resolve()
+        self.debounce_interval = debounce_interval
+        self.timers = {} # A dictionary to manage debounce timers for file paths.
+        self.ignore_root = self.repo_path
+        self.ignore_spec = ignore_spec
+        self._load_ignore_spec(cgcignore_path)
+        
+        # Caches for the repository's state.
+        self.all_file_data = []
+        self.imports_map = {}
+        
+        # Perform the initial scan and linking when the watcher is created.
+        if perform_initial_scan:
+            self._initial_scan()
+
+    def _load_ignore_spec(self, cgcignore_path: str = None) -> None:
+        """Load .cgcignore rules using the same defaults as repository indexing."""
+        if self.ignore_spec is not None:
+            return
+        try:
+            self.ignore_spec, resolved_cgcignore = build_ignore_spec(
+                ignore_root=self.ignore_root,
+                default_patterns=DEFAULT_IGNORE_PATTERNS,
+                explicit_path=cgcignore_path,
+            )
+            if resolved_cgcignore:
+                debug_log(
+                    f"Watcher using .cgcignore at {resolved_cgcignore} "
+                    f"(filtering relative to {self.ignore_root})"
+                )
+        except OSError as e:
+            self.ignore_spec = None
+            warning_logger(f"Could not load/create watcher .cgcignore: {e}")
+
+    def _should_ignore(self, path: str | Path) -> bool:
+        """Return True when a path is excluded by .cgcignore or IGNORE_DIRS."""
+        path_obj = Path(path).resolve()
+        ignore_root = getattr(self, "ignore_root", getattr(self, "repo_path", None))
+
+        ignore_dirs_str = get_config_value("IGNORE_DIRS") or ""
+        if ignore_dirs_str and ignore_root:
+            ignore_dirs = {d.strip().lower() for d in ignore_dirs_str.split(",") if d.strip()}
+            try:
+                parts = {p.lower() for p in path_obj.relative_to(ignore_root).parent.parts}
+                if parts.intersection(ignore_dirs):
+                    return True
+            except ValueError:
+                pass
+
+        ignore_spec = getattr(self, "ignore_spec", None)
+        if not ignore_spec or not ignore_root:
+            return False
+
+        try:
+            rel_path = path_obj.relative_to(ignore_root).as_posix()
+        except ValueError:
+            return False
+        return ignore_spec.match_file(rel_path)
+
+    def _is_supported_code_file(self, path: str | Path) -> bool:
+        path_obj = Path(path)
+        return path_obj.is_file() and path_obj.suffix in self.graph_builder.parsers and not self._should_ignore(path_obj)
+
+    def _iter_supported_files(self) -> list[Path]:
+        from codegraphcontext.tools.indexing.discovery import discover_files_to_index
+        supported_extensions = self.graph_builder.parsers.keys()
+        files, _ = discover_files_to_index(
+            self.repo_path,
+            supported_extensions=set(supported_extensions),
+        )
+        return files
+
+    def _initial_scan(self):
+        """Scans the entire repository, parses all files, and builds the initial graph."""
+        info_logger(f"Performing initial scan for watcher: {self.repo_path}")
+        all_files = self._iter_supported_files()
+        
+        # 1. Pre-scan all files to get a global map of where every symbol is defined.
+        self.imports_map = self.graph_builder.pre_scan_imports(all_files)
+        
+        # 2. Parse all files in detail and cache the parsed data.
+        for f in all_files:
+            parsed_data = self.graph_builder.parse_file(self.repo_path, f)
+            if "error" not in parsed_data:
+                self.all_file_data.append(parsed_data)
+        
+        # 3. After all files are parsed, create the relationships (e.g., function calls) between them.
+        self.graph_builder.link_function_calls(self.all_file_data, self.imports_map)
+        self.graph_builder.link_inheritance(self.all_file_data, self.imports_map)
+        # Free memory — all_file_data is only needed during the linking pass.
+        self.all_file_data.clear()
+        info_logger(f"Initial scan and graph linking complete for: {self.repo_path}")
+
+    def _debounce(self, event_path, action):
+        """
+        Schedules an action to run after a debounce interval.
+        This prevents the handler from firing on every single file save event in rapid
+        succession, which is common in IDEs. It waits for a quiet period before processing.
+        """
+        # If a timer already exists for this path, cancel it.
+        if event_path in self.timers:
+            self.timers[event_path].cancel()
+        # Create and start a new timer.
+        timer = threading.Timer(self.debounce_interval, action)
+        timer.start()
+        self.timers[event_path] = timer
+
+    def _update_imports_map_for_file(self, changed_path: Path):
+        """Re-scan a single file and merge its contributions into self.imports_map.
+        Removes stale paths for the file before inserting new ones so renamed/deleted
+        symbols don't leave dangling entries."""
+        changed_str = str(changed_path.resolve())
+        # Remove old contributions of this file from every symbol it previously exported.
+        for symbol in list(self.imports_map.keys()):
+            old_list = self.imports_map[symbol]
+            if changed_str in old_list:
+                new_list = [p for p in old_list if p != changed_str]
+                if new_list:
+                    self.imports_map[symbol] = new_list
+                else:
+                    del self.imports_map[symbol]
+        # Merge new contributions (if the file still exists).
+        if changed_path.exists():
+            new_map = self.graph_builder.pre_scan_imports([changed_path])
+            for symbol, paths in new_map.items():
+                if symbol not in self.imports_map:
+                    self.imports_map[symbol] = []
+                self.imports_map[symbol].extend(paths)
+
+    def _handle_modification(self, event_path_str: str):
+        """
+        Incremental update: only re-parse and re-link the changed file plus the files
+        that previously called into it.  O(k) instead of O(n) for every event.
+
+        Algorithm:
+          1. Query Neo4j for files that have CALLS/INHERITS touching the changed file
+             (must happen BEFORE nodes are deleted, so the graph still has the old edges).
+          2. Update self.imports_map for the changed file only (O(1) file scan).
+          3. update_file_in_graph — DETACH DELETE cleans up ALL CALLS/INHERITS on the
+             changed file's nodes (both incoming and outgoing) automatically.
+          4. Delete outgoing CALLS from affected *caller* files (their CALLS to the changed
+             file were removed by DETACH DELETE, but their CALLS to unrelated files are
+             still there; we must delete all their outgoing CALLS before re-creating so we
+             don't leave stale CALLS to functions that have moved/been renamed).
+          5. Re-parse only the affected subset (changed file + callers + inheritors).
+          6. Build file_class_lookup cheaply from Neo4j (no full re-parse needed).
+          7. Re-create CALLS/INHERITS for the subset only.
+        """
+        info_logger(f"File change detected (incremental update): {event_path_str}")
+        changed_path = Path(event_path_str)
+        if self._should_ignore(changed_path):
+            debug_log(f"Ignored watcher update based on .cgcignore: {changed_path}")
+            return
+
+        changed_path_str = str(changed_path.resolve())
+        supported_extensions = self.graph_builder.parsers.keys()
+
+        # Step 1: Find affected neighbours BEFORE nodes are destroyed.
+        caller_paths = self.graph_builder.get_caller_file_paths(changed_path_str)
+        inheritor_paths = self.graph_builder.get_inheritance_neighbor_paths(changed_path_str)
+        affected_paths = {changed_path_str} | caller_paths | inheritor_paths
+        info_logger(
+            f"[INCREMENTAL] affected={len(affected_paths)} files "
+            f"(callers={len(caller_paths)}, inheritors={len(inheritor_paths)})"
+        )
+
+        # Step 2: Update imports_map for the changed file only.
+        self._update_imports_map_for_file(changed_path)
+
+        # Step 3: Delete + re-add nodes for the changed file.
+        # DETACH DELETE inside update_file_in_graph removes all CALLS/INHERITS on its nodes.
+        self.graph_builder.update_file_in_graph(changed_path, self.repo_path, self.imports_map)
+
+        # Step 4: Clean up CALLS/INHERITS from the affected *caller/inheritor* files.
+        # Their CALLS to the changed file were already removed by DETACH DELETE, but their
+        # CALLS to other files are still intact.  We delete all their outgoing CALLS so we
+        # can safely re-create the full set from scratch for the subset.
+        other_callers = list(caller_paths)       # does NOT include changed_path_str
+        other_inheritors = list(inheritor_paths)
+        if other_callers:
+            self.graph_builder.delete_outgoing_calls_from_files(other_callers)
+        if other_inheritors:
+            self.graph_builder.delete_inherits_for_files(other_inheritors)
+
+        # Step 5: Re-parse only the affected subset.
+        subset_file_data = []
+        for path_str in affected_paths:
+            p = Path(path_str)
+            if p.exists() and p.suffix in supported_extensions and not self._should_ignore(p):
+                parsed = self.graph_builder.parse_file(self.repo_path, p)
+                if "error" not in parsed:
+                    subset_file_data.append(parsed)
+
+        # Step 6: Get full-repo file_class_lookup from Neo4j (avoids re-parsing all files).
+        # The changed file's new classes are already overlaid inside _create_all_function_calls.
+        file_class_lookup = self.graph_builder.get_repo_class_lookup(self.repo_path)
+
+        # Step 7: Re-create CALLS/INHERITS for the affected subset only.
+        info_logger(f"[INCREMENTAL] Re-linking {len(subset_file_data)} files...")
+        self.graph_builder.link_function_calls(subset_file_data, self.imports_map, file_class_lookup)
+        self.graph_builder.link_inheritance(subset_file_data, self.imports_map)
+
+        # Step 8+9: Phase 4 (embeddings) and Phase 5 (inheritance re-resolution).
+        # Both are gated by env-var flags.  Each is wrapped in its own try/except
+        # so a failure in one never prevents the other from running.
+        try:
+            from codegraphcontext.cli.config_manager import get_config_value as _gcv
+            _vector_enabled = (_gcv("ENABLE_VECTOR_RESOLVE") or "false").lower() == "true"
+            _inherit_enabled = (_gcv("ENABLE_INHERIT_RESOLVE") or "false").lower() == "true"
+        except Exception as _cfg_e:
+            warning_logger(f"[PHASE4/5] Could not read config flags: {_cfg_e}")
+            _vector_enabled = False
+            _inherit_enabled = False
+
+        if _vector_enabled:
+            try:
+                from codegraphcontext.tools.indexing.embeddings import EmbeddingPipeline
+                embed_pipeline = EmbeddingPipeline(self.graph_builder.driver)
+                embed_pipeline.invalidate_for_file(changed_path_str)
+                embed_pipeline.run(str(self.repo_path))
+                info_logger(f"[EMBED] Incremental embedding complete for {changed_path_str}")
+            except Exception as _e:
+                warning_logger(f"[EMBED] Incremental embedding failed: {_e}")
+
+        if _inherit_enabled:
+            try:
+                from codegraphcontext.tools.indexing.resolution.post_resolution import run_inheritance_reresolve
+                # Build a VectorResolver when embeddings are also enabled so tier-11
+                # edges fire incrementally, not just during full indexing runs.
+                _vector_resolver = None
+                if _vector_enabled:
+                    try:
+                        from codegraphcontext.tools.indexing.vector_resolver import VectorResolver
+                        _vector_resolver = VectorResolver(self.graph_builder.driver)
+                    except Exception as _ve:
+                        warning_logger(f"[VECTOR] Resolver unavailable for watcher: {_ve}")
+                n_improved = run_inheritance_reresolve(
+                    self.graph_builder.driver, str(self.repo_path), _vector_resolver
+                )
+                info_logger(f"[INHERIT-RESOLVE] Incremental: {n_improved} edges improved")
+            except Exception as _e:
+                warning_logger(f"[INHERIT-RESOLVE] Incremental failed: {_e}")
+
+        info_logger(f"[INCREMENTAL] Done. Graph refresh for {event_path_str} complete! ✅")
+
+    # The following methods are called by the watchdog observer when a file event occurs.
+    def on_created(self, event):
+        if not event.is_directory and self._is_supported_code_file(event.src_path):
+            self._debounce(event.src_path, lambda: self._handle_modification(event.src_path))
+
+    def on_modified(self, event):
+        if not event.is_directory and self._is_supported_code_file(event.src_path):
+            self._debounce(event.src_path, lambda: self._handle_modification(event.src_path))
+
+    def on_deleted(self, event):
+        if not event.is_directory and Path(event.src_path).suffix in self.graph_builder.parsers and not self._should_ignore(event.src_path):
+            self._debounce(event.src_path, lambda: self._handle_modification(event.src_path))
+
+    def on_moved(self, event):
+        if not event.is_directory:
+            if Path(event.src_path).suffix in self.graph_builder.parsers and not self._should_ignore(event.src_path):
+                self._debounce(event.src_path, lambda: self._handle_modification(event.src_path))
+            if Path(event.dest_path).suffix in self.graph_builder.parsers and not self._should_ignore(event.dest_path):
+                self._debounce(event.dest_path, lambda: self._handle_modification(event.dest_path))
+
+
+class CodeWatcher:
+    """
+    Manages the file system observer thread. It can watch multiple directories,
+    assigning a separate `RepositoryEventHandler` to each one.
+    """
+    def __init__(self, graph_builder: "GraphBuilder", job_manager= "JobManager"):
+        self.graph_builder = graph_builder
+        self.observer = Observer()
+        self.watched_paths = set() # Keep track of paths already being watched.
+        self.watches = {} # Store watch objects to allow unscheduling
+
+    def watch_directory(self, path: str, perform_initial_scan: bool = True, cgcignore_path: str = None):
+        """Schedules a directory to be watched for changes."""
+        path_obj = Path(path).resolve()
+        path_str = str(path_obj)
+
+        if path_str in self.watched_paths:
+            info_logger(f"Path already being watched: {path_str}")
+            return {"message": f"Path already being watched: {path_str}"}
+        
+        # Create a new, dedicated event handler for this specific repository path.
+        event_handler = RepositoryEventHandler(
+            self.graph_builder,
+            path_obj,
+            perform_initial_scan=perform_initial_scan,
+            cgcignore_path=cgcignore_path,
+        )
+        
+        watch = self.observer.schedule(event_handler, path_str, recursive=True)
+        self.watches[path_str] = watch
+        self.watched_paths.add(path_str)
+        info_logger(f"Started watching for code changes in: {path_str}")
+        
+        return {"message": f"Started watching {path_str}."}
+    def unwatch_directory(self, path: str):
+        """Stops watching a directory for changes."""
+        path_obj = Path(path).resolve()
+        path_str = str(path_obj)
+
+        if path_str not in self.watched_paths:
+            warning_logger(f"Attempted to unwatch a path that is not being watched: {path_str}")
+            return {"error": f"Path not currently being watched: {path_str}"}
+
+        watch = self.watches.pop(path_str, None)
+        if watch:
+            self.observer.unschedule(watch)
+        
+        self.watched_paths.discard(path_str)
+        info_logger(f"Stopped watching for code changes in: {path_str}")
+        return {"message": f"Stopped watching {path_str}."}
+
+    def list_watched_paths(self) -> list:
+        """Returns a list of all currently watched directory paths."""
+        return list(self.watched_paths)
+
+    def start(self):
+        """Starts the observer thread."""
+        if not self.observer.is_alive():
+            self.observer.start()
+            info_logger("Code watcher observer thread started.")
+
+    def stop(self):
+        """Stops the observer thread gracefully."""
+        if self.observer.is_alive():
+            self.observer.stop()
+            self.observer.join() # Wait for the thread to terminate.
+            info_logger("Code watcher observer thread stopped.")
